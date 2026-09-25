@@ -25,6 +25,7 @@ import (
 	sdkConfig "github.com/kairos-io/kairos/v4/sdk/types/config"
 	sdkImage "github.com/kairos-io/kairos/v4/sdk/types/images"
 	sdkUtils "github.com/kairos-io/kairos/v4/sdk/utils"
+	yipSchema "github.com/mudler/yip/pkg/schema"
 	"github.com/twpayne/go-vfs/v5"
 	"golang.org/x/sys/unix"
 )
@@ -58,38 +59,51 @@ type RawImage struct {
 	// such as Nvidia Jetson AGX Orin. Only valid together with an EFI build.
 	SeparatePartitionsImages bool
 	maas                     bool // if true, add the curtin-landing partition (COS_CURTIN) carrying /curtin/curtin-hooks (MAAS deploy)
+	// BootActive, when true, adds a COS_STATE partition with active.img so the disk boots straight into active.
+	BootActive        bool
+	systemImageSizeMB uint // size of recovery.img, reused for active.img
+}
+
+// RawImageParams holds the inputs for building a raw disk image.
+type RawImageParams struct {
+	Source                   string // rootfs dir used for the recovery and active images
+	Output                   string // output dir for the final image
+	CloudConfig              string // cloud config copied to the OEM partition
+	FinalSize                uint64 // final disk size in MB
+	StateSize                int64  // state partition size in MB
+	RecoveryImageSize        int64  // recovery image size in MB
+	NoDefaultCloudConfig     bool
+	SeparatePartitionsImages bool
+	MAAS                     bool
+	BootActive               bool
 }
 
 // NewEFIRawImage creates a new RawImage struct
 // config is initialized with a default config to use the standard logger
-func NewEFIRawImage(source, output, cc string, finalsize uint64, stateSize, recoveryImageSize int64, noDefaultCloudConfig bool) *RawImage {
-	cfg := config.NewConfig(config.WithLogger(internal.Log))
-	return &RawImage{
-		efi:                  true,
-		config:               cfg,
-		Source:               source,
-		Output:               output,
-		elemental:            elemental.NewElemental(cfg),
-		CloudConfig:          cc,
-		FinalSize:            finalsize,
-		StateSize:            stateSize,
-		RecoveryImageSize:    recoveryImageSize,
-		NoDefaultCloudConfig: noDefaultCloudConfig,
-	}
+func NewEFIRawImage(params RawImageParams) *RawImage {
+	return newRawImage(params, true)
 }
 
-func NewBiosRawImage(source, output string, cc string, finalsize uint64, stateSize, recoveryImageSize int64, noDefaultCloudConfig bool) *RawImage {
+func NewBiosRawImage(params RawImageParams) *RawImage {
+	return newRawImage(params, false)
+}
+
+func newRawImage(params RawImageParams, efi bool) *RawImage {
 	cfg := config.NewConfig(config.WithLogger(internal.Log))
-	return &RawImage{efi: false,
-		config:               cfg,
-		Source:               source,
-		Output:               output,
-		elemental:            elemental.NewElemental(cfg),
-		CloudConfig:          cc,
-		FinalSize:            finalsize,
-		StateSize:            stateSize,
-		RecoveryImageSize:    recoveryImageSize,
-		NoDefaultCloudConfig: noDefaultCloudConfig,
+	return &RawImage{
+		efi:                      efi,
+		config:                   cfg,
+		Source:                   params.Source,
+		Output:                   params.Output,
+		elemental:                elemental.NewElemental(cfg),
+		CloudConfig:              params.CloudConfig,
+		FinalSize:                params.FinalSize,
+		StateSize:                params.StateSize,
+		RecoveryImageSize:        params.RecoveryImageSize,
+		NoDefaultCloudConfig:     params.NoDefaultCloudConfig,
+		SeparatePartitionsImages: params.SeparatePartitionsImages,
+		maas:                     params.MAAS,
+		BootActive:               params.BootActive,
 	}
 }
 
@@ -112,103 +126,43 @@ func (r *RawImage) createOemPartitionImage(recoveryImagePath string) (string, er
 		return "", err
 	}
 	if r.CloudConfig != "" && len(ccContent) > 0 {
-		internal.Log.Logger.Debug().Str("source", r.CloudConfig).Str("target", filepath.Join(tmpDirOem, "90_custom.yaml")).Msg("Copying cloud config to oem partition")
+		internal.Log.Logger.Debug().Str("source", r.CloudConfig).Str("target", filepath.Join(tmpDirOem, customCloudInitFile)).Msg("Copying cloud config to oem partition")
 		f, err := r.config.Fs.ReadFile(r.CloudConfig)
 		if err != nil {
 			return "", err
 		}
-		internal.Log.Logger.Debug().Str("source", r.CloudConfig).Str("target", filepath.Join(tmpDirOem, "90_custom.yaml")).Str("content", string(f)).Interface("s", f).Msg("Copying cloud config to oem partition")
-		err = fsutils.Copy(r.config.Fs, r.CloudConfig, filepath.Join(tmpDirOem, "90_custom.yaml"))
+		internal.Log.Logger.Debug().Str("source", r.CloudConfig).Str("target", filepath.Join(tmpDirOem, customCloudInitFile)).Str("content", string(f)).Interface("s", f).Msg("Copying cloud config to oem partition")
+		err = fsutils.Copy(r.config.Fs, r.CloudConfig, filepath.Join(tmpDirOem, customCloudInitFile))
 		if err != nil {
-			internal.Log.Logger.Error().Err(err).Str("source", r.CloudConfig).Str("target", filepath.Join(tmpDirOem, "90_custom.yaml")).Msg("failed to copy cloud config")
+			internal.Log.Logger.Error().Err(err).Str("source", r.CloudConfig).Str("target", filepath.Join(tmpDirOem, customCloudInitFile)).Msg("failed to copy cloud config")
 			return "", err
 		}
 	} else if !r.NoDefaultCloudConfig {
 		// Create a default cloud config yaml with at least a user
-		internal.Log.Logger.Debug().Str("target", filepath.Join(tmpDirOem, "90_custom.yaml")).Msg("Creating default cloud config")
-		err = r.config.Fs.WriteFile(filepath.Join(tmpDirOem, "90_custom.yaml"), []byte(constants.DefaultCloudConfig), 0o644)
+		internal.Log.Logger.Debug().Str("target", filepath.Join(tmpDirOem, customCloudInitFile)).Msg("Creating default cloud config")
+		err = r.config.Fs.WriteFile(filepath.Join(tmpDirOem, customCloudInitFile), []byte(constants.DefaultCloudConfig), 0o644)
 		if err != nil {
-			internal.Log.Logger.Error().Err(err).Str("target", filepath.Join(tmpDirOem, "90_custom.yaml")).Msg("failed to write cloud config")
+			internal.Log.Logger.Error().Err(err).Str("target", filepath.Join(tmpDirOem, customCloudInitFile)).Msg("failed to write cloud config")
 			return "", err
 		}
 	}
 
-	// Set the grubenv to boot into recovery
-	err = agentUtils.SetPersistentVariables(filepath.Join(tmpDirOem, "grubenv"), map[string]string{"next_entry": "recovery"}, r.config)
+	firstBootFile, firstBootConfig, err := r.firstBootConfig(recoveryImagePath)
 	if err != nil {
 		return "", err
 	}
-
-	resetCloudInit := "01_reset.yaml"
-
-	// Calculate the size of the state partition based on the recovery image size
-	info, err := r.config.Fs.Stat(recoveryImagePath)
-	if err != nil {
-		internal.Log.Logger.Error().Err(err).Str("source", recoveryImagePath).Msg("failed to stat recovery image")
-		return "", err
+	if !r.BootActive {
+		// Set the grubenv to boot into recovery so the first boot can autoreset
+		err = agentUtils.SetPersistentVariables(filepath.Join(tmpDirOem, grubOEMEnvFile), map[string]string{grubNextEntryKey: grubRecoveryEntry}, r.config)
+		if err != nil {
+			return "", err
+		}
 	}
 
-	var stateSize int64
-	if r.StateSize > 0 {
-		// Use the state size from the config
-		// stateSize is in MB so we can use it directly
-		stateSize = r.StateSize
-	} else {
-		stateSize = (info.Size()*3 + 100*1024*1024) / (1024 * 1024)
-	}
-
-	internal.Log.Logger.Debug().Int64("size", stateSize).Msg("calculated state partition size")
-
-	// Create a reset config
-	// This:
-	// - Adds a state partition with the calculated size
-	// - Adds a persistent partition with the rest of the disk
-	// - If the recovery mode file is present, it will run the reset command unattended
-	// - If the reset cloud init file is present, it will remove it. Magic! So we dont get any traces of the extra config for raw images
-	conf := fmt.Sprintf(`name: Expand disk layout and autoreset
-stages:
-    after-reset:
-        - commands:
-            - rm /oem/%[8]s
-          if: '[ -f "/oem/%[8]s" ]'
-          name: Auto remove this file
-    network:
-        - commands:
-            - udevadm trigger
-          name: Trigger udevadm
-        - commands:
-            - kairos-agent --debug reset --unattended --reboot
-          if: '[ -f "/run/cos/recovery_mode" ] && [ ! -f "/oem/.autoreset.skip" ]'
-          name: Run auto reset
-    rootfs.before:
-        - name: Add state partition
-          layout:
-            device:
-                label: %[1]s
-            add_partitions:
-                - fsLabel: %[2]s
-                  size: %[3]d
-                  pLabel: %[4]s
-                  filesystem: %[5]s
-                - fsLabel: %[6]s
-                  pLabel: %[7]s
-                  filesystem: %[5]s
-`,
-		sdkConstants.RecoveryLabel,      // 1
-		sdkConstants.StateLabel,         // 2
-		stateSize,                       // 3
-		sdkConstants.StatePartName,      // 4
-		sdkConstants.LinuxImgFs,         // 5
-		sdkConstants.PersistentLabel,    // 6
-		sdkConstants.PersistentPartName, // 7
-		resetCloudInit,                  // 8
-	)
-
-	// Save the cloud config
-	internal.Log.Logger.Debug().Str("target", filepath.Join(tmpDirOem, resetCloudInit)).Msg("Creating reset cloud config")
-	err = r.config.Fs.WriteFile(filepath.Join(tmpDirOem, resetCloudInit), []byte(conf), 0o644)
+	internal.Log.Logger.Debug().Str("target", filepath.Join(tmpDirOem, firstBootFile)).Msg("Creating first boot cloud config")
+	err = r.config.Fs.WriteFile(filepath.Join(tmpDirOem, firstBootFile), []byte(firstBootConfig.ToString()), 0o644)
 	if err != nil {
-		internal.Log.Logger.Error().Err(err).Str("target", filepath.Join(tmpDirOem, resetCloudInit)).Msg("failed to write cloud config")
+		internal.Log.Logger.Error().Err(err).Str("target", filepath.Join(tmpDirOem, firstBootFile)).Msg("failed to write cloud config")
 		return "", err
 	}
 
@@ -232,6 +186,38 @@ stages:
 	return OemPartitionImage.File, nil
 }
 
+// firstBootConfig returns the OEM file name and the yip config that finishes the disk layout on first boot.
+func (r *RawImage) firstBootConfig(recoveryImagePath string) (string, *yipSchema.YipConfig, error) {
+	if r.BootActive {
+		return layoutCloudInitFile, bootActiveFirstBootConfig(), nil
+	}
+	stateSize, err := r.resetStateSizeMB(recoveryImagePath)
+	if err != nil {
+		return "", nil, err
+	}
+	return resetCloudInitFile, resetFirstBootConfig(stateSize), nil
+}
+
+// resetStateSizeMB returns the configured state size or one derived from the recovery partition image.
+func (r *RawImage) resetStateSizeMB(recoveryImagePath string) (int64, error) {
+	if r.StateSize > 0 {
+		return r.StateSize, nil
+	}
+	info, err := r.config.Fs.Stat(recoveryImagePath)
+	if err != nil {
+		internal.Log.Logger.Error().Err(err).Str("source", recoveryImagePath).Msg("failed to stat recovery image")
+		return 0, err
+	}
+	stateSize := (info.Size()*3 + 100*1024*1024) / (1024 * 1024)
+	internal.Log.Logger.Debug().Int64("size", stateSize).Msg("calculated state partition size")
+	return stateSize, nil
+}
+
+const (
+	curtinLabel    = "COS_CURTIN"
+	curtinPartName = "curtin"
+)
+
 // createCurtinLandingPartitionImage builds a tiny ext2 partition that curtin
 // will select as its target (it holds /curtin). It carries a static busybox
 // (so the chroot needs no libc), stub cloud-init/netplan (so MAAS's in-target
@@ -252,7 +238,7 @@ func (r *RawImage) createCurtinLandingPartitionImage() (string, error) {
 	img := sdkImage.Image{
 		File:       filepath.Join(r.TempDir(), "curtin-landing.img"),
 		FS:         sdkConstants.LinuxImgFs,
-		Label:      "COS_CURTIN",
+		Label:      curtinLabel,
 		Size:       64, // MB; busybox ~1.2MB + stubs, 64 matches OEM and is safe
 		Source:     sdkImage.NewDirSrc(staging),
 		MountPoint: mountp,
@@ -349,6 +335,7 @@ func (r *RawImage) createRecoveryPartitionImage() (string, error) {
 	if r.RecoveryImageSize > 0 {
 		internal.Log.Logger.Info().Int64("size", r.RecoveryImageSize).Msg("Using configured recovery image size")
 	}
+	r.systemImageSizeMB = recoveryImage.Size
 
 	_, err = r.elemental.DeployImage(recoveryImage, false)
 	// Create recovery.squash from the rootfs into the recovery partition under cOS/
@@ -459,19 +446,20 @@ func (r *RawImage) createEFIPartitionImage() (string, error) {
 		return "", err
 	}
 
+	efiGrubCfg := r.efiGrubCfg()
 	if strings.Contains(flavor, "ubuntu") {
 		err = fsutils.MkdirAll(r.config.Fs, filepath.Join(tmpDirEfi, "EFI", "ubuntu"), 0755)
 		if err != nil {
 			internal.Log.Logger.Error().Err(err).Str("target", tmpDirEfi).Msg("failed to create ubuntu dir")
 			return "", err
 		}
-		err = r.config.Fs.WriteFile(filepath.Join(tmpDirEfi, "EFI", "ubuntu", "grub.cfg"), []byte(constants.GrubEfiRecovery), 0o644)
+		err = r.config.Fs.WriteFile(filepath.Join(tmpDirEfi, "EFI", "ubuntu", "grub.cfg"), []byte(efiGrubCfg), 0o644)
 		if err != nil {
 			internal.Log.Logger.Error().Err(err).Str("target", tmpDirEfi).Msg("failed to write grub.cfg")
 			return "", err
 		}
 	} else {
-		err = r.config.Fs.WriteFile(filepath.Join(tmpDirEfi, "EFI", "BOOT", "grub.cfg"), []byte(constants.GrubEfiRecovery), 0o644)
+		err = r.config.Fs.WriteFile(filepath.Join(tmpDirEfi, "EFI", "BOOT", "grub.cfg"), []byte(efiGrubCfg), 0o644)
 		if err != nil {
 			internal.Log.Logger.Error().Err(err).Str("target", tmpDirEfi).Msg("failed to write grub.cfg")
 			return "", err
@@ -517,6 +505,14 @@ func (r *RawImage) createEFIPartitionImage() (string, error) {
 	}
 
 	return efiPartitionImage.File, nil
+}
+
+// efiGrubCfg returns the EFI grub.cfg that chainloads either the state or the recovery grub config.
+func (r *RawImage) efiGrubCfg() string {
+	if r.BootActive {
+		return constants.GrubEfiState
+	}
+	return constants.GrubEfiRecovery
 }
 
 // createBiosPartitionImage creates a BIOS partition image
@@ -614,9 +610,10 @@ func (r *RawImage) Build() error {
 		return nil
 	}
 
-	// Create the final disk image
-	internal.Log.Logger.Info().Str("target", filepath.Join(r.Output, outputName)).Msg("Assembling final disk image")
-	parts := []string{bootImagePath, oemImagePath, recoveryImagePath}
+	parts := []diskPart{
+		{img: oemImagePath, name: sdkConstants.OEMPartName, guidLabel: sdkConstants.OEMLabel},
+		{img: recoveryImagePath, name: agentConstants.RecoveryImgName, guidLabel: sdkConstants.RecoveryLabel},
+	}
 	if r.maas {
 		landing, err := r.createCurtinLandingPartitionImage()
 		if err != nil {
@@ -624,9 +621,24 @@ func (r *RawImage) Build() error {
 			return err
 		}
 		defer r.config.Fs.Remove(landing)
-		parts = []string{bootImagePath, landing, oemImagePath, recoveryImagePath}
+		parts = append([]diskPart{{img: landing, name: curtinPartName, guidLabel: curtinLabel}}, parts...)
 	}
-	err = r.createDiskImage(filepath.Join(r.Output, outputName), parts)
+	// State goes last so recovery keeps its index and persistent is appended after state on first boot
+	if r.BootActive {
+		internal.Log.Logger.Info().Msg("Creating STATE image")
+		stateImagePath, err := r.createStatePartitionImage()
+		if err != nil {
+			internal.Log.Logger.Error().Err(err).Msg("failed to create state partition")
+			return err
+		}
+		defer r.config.Fs.Remove(stateImagePath)
+		parts = append(parts, diskPart{img: stateImagePath, name: sdkConstants.StatePartName, guidLabel: sdkConstants.StateLabel})
+		internal.Log.Logger.Info().Msg("Created STATE image")
+	}
+
+	// Create the final disk image
+	internal.Log.Logger.Info().Str("target", filepath.Join(r.Output, outputName)).Msg("Assembling final disk image")
+	err = r.createDiskImage(filepath.Join(r.Output, outputName), bootImagePath, parts)
 	if err != nil {
 		internal.Log.Logger.Error().Err(err).Msg("failed to create disk image")
 		return err
@@ -685,9 +697,16 @@ func (r *RawImage) emitPartitionImages(bootImagePath, oemImagePath, recoveryImag
 	return nil
 }
 
+// diskPart is a partition image placed after the boot partition in the final disk.
+type diskPart struct {
+	img       string
+	name      string
+	guidLabel string
+}
+
 // createDiskImage creates the final image by truncating the image with the proper size and
 // concatenating the contents of the given partitions.
-func (r *RawImage) createDiskImage(rawDiskFile string, partImgs []string) error {
+func (r *RawImage) createDiskImage(rawDiskFile, bootImg string, extraParts []diskPart) error {
 	var initDiskFile, endDiskFile string
 	var err error
 	var partFiles []string
@@ -695,7 +714,7 @@ func (r *RawImage) createDiskImage(rawDiskFile string, partImgs []string) error 
 	var table partition.Table
 	var parts []*gpt.Partition
 
-	internal.Log.Logger.Debug().Str("disk", rawDiskFile).Strs("parts", partImgs).Msg("Creating disk image")
+	internal.Log.Logger.Debug().Str("disk", rawDiskFile).Str("boot", bootImg).Interface("parts", extraParts).Msg("Creating disk image")
 
 	// Create disk image, 1Mb for alignment and GPT header, 2MB for bios boot partition
 	// Then concat all partition images
@@ -728,9 +747,9 @@ func (r *RawImage) createDiskImage(rawDiskFile string, partImgs []string) error 
 	}
 
 	// List and concatenate all image files
-	partFiles = append(partFiles, initDiskFile)
-	for _, img := range partImgs {
-		partFiles = append(partFiles, img)
+	partFiles = append(partFiles, initDiskFile, bootImg)
+	for _, p := range extraParts {
+		partFiles = append(partFiles, p.img)
 	}
 	partFiles = append(partFiles, endDiskFile)
 	err = utils.ConcatFiles(vfs.OSFS, partFiles, rawDiskFile)
@@ -760,9 +779,9 @@ func (r *RawImage) createDiskImage(rawDiskFile string, partImgs []string) error 
 	// Bit 2: Legacy BIOS bootable This indicates that this partition is bootable by legacy BIOS.
 	if r.efi {
 		// EFI
-		stat, err = os.Stat(partImgs[0])
+		stat, err = os.Stat(bootImg)
 		if err != nil {
-			internal.Log.Logger.Error().Err(err).Str("target", partImgs[0]).Msg("failed to stat efi partition")
+			internal.Log.Logger.Error().Err(err).Str("target", bootImg).Msg("failed to stat efi partition")
 			return err
 		}
 		size = roundToNearestSector(stat.Size(), finalDisk.LogicalBlocksize)
@@ -790,28 +809,8 @@ func (r *RawImage) createDiskImage(rawDiskFile string, partImgs []string) error 
 		})
 	}
 
-	// Build the remaining partitions (OEM, Recovery for 3-part; landing, OEM, Recovery for 4-part)
-	type postBootPart struct {
-		img       string
-		name      string
-		guidLabel string
-	}
-	var pbp []postBootPart
-	if len(partImgs) == 4 {
-		// maas: boot, landing, oem, recovery
-		pbp = []postBootPart{
-			{partImgs[1], "curtin", "COS_CURTIN"},
-			{partImgs[2], sdkConstants.OEMPartName, sdkConstants.OEMLabel},
-			{partImgs[3], agentConstants.RecoveryImgName, sdkConstants.RecoveryLabel},
-		}
-	} else {
-		pbp = []postBootPart{
-			{partImgs[1], sdkConstants.OEMPartName, sdkConstants.OEMLabel},
-			{partImgs[2], agentConstants.RecoveryImgName, sdkConstants.RecoveryLabel},
-		}
-	}
 	idx := 2
-	for _, p := range pbp {
+	for _, p := range extraParts {
 		st, err := os.Stat(p.img)
 		if err != nil {
 			internal.Log.Logger.Error().Err(err).Str("target", p.img).Msg("failed to stat partition")

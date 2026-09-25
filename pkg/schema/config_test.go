@@ -152,4 +152,26 @@ var _ = Describe("Config Validate", func() {
 		Expect(err.Error()).To(ContainSubstring("partitions"))
 		Expect(err.Error()).To(ContainSubstring("vhd"))
 	})
+
+	It("passes for boot-active combined with efi, gce and vhd", func() {
+		cfg.Disk.BootActive = true
+		cfg.Disk.EFI = true
+		cfg.Disk.GCE = true
+		cfg.Disk.VHD = true
+		Expect(cfg.Validate()).To(Succeed())
+	})
+
+	DescribeTable("rejects boot-active combined with unsupported disk types",
+		func(set func(*schema.Config), option string) {
+			cfg.Disk.BootActive = true
+			set(&cfg)
+			err := cfg.Validate()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("boot_active"))
+			Expect(err.Error()).To(ContainSubstring(option))
+		},
+		Entry("bios", func(c *schema.Config) { c.Disk.BIOS = true }, "bios"),
+		Entry("partitions", func(c *schema.Config) { c.Disk.Partitions = true }, "partitions"),
+		Entry("maas", func(c *schema.Config) { c.Disk.MAAS = true }, "maas"),
+	)
 })

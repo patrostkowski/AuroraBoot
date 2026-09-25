@@ -148,14 +148,28 @@ func (d *Deployer) StepGenRawDisk() error {
 			return d.Config.Disk.EFI || d.Config.Disk.GCE || d.Config.Disk.VHD || d.Config.Disk.Partitions || d.Config.Disk.MAAS
 		}),
 		herd.WithDeps(constants.OpDumpSource),
-		herd.WithCallback(ops.GenEFIRawDisk(d.tmpRootFs(), d.rawDiskPath(), d.rawDiskSize(), d.rawDiskStateSize(), d.rawDiskRecoveryImageSize(), d.Config.NoDefaultCloudConfig, d.Config.Disk.Partitions, d.Config.Disk.MAAS)))
+		herd.WithCallback(ops.GenEFIRawDisk(d.rawImageParams())))
 }
 
 func (d *Deployer) StepGenMBRRawDisk() error {
 	return d.Add(constants.OpGenBIOSRawDisk,
 		herd.EnableIf(func() bool { return d.Config.Disk.BIOS }),
 		herd.WithDeps(constants.OpDumpSource),
-		herd.WithCallback(ops.GenBiosRawDisk(d.tmpRootFs(), d.rawDiskPath(), d.rawDiskSize(), d.rawDiskStateSize(), d.rawDiskRecoveryImageSize(), d.Config.NoDefaultCloudConfig)))
+		herd.WithCallback(ops.GenBiosRawDisk(d.rawImageParams())))
+}
+
+func (d *Deployer) rawImageParams() ops.RawImageParams {
+	return ops.RawImageParams{
+		Source:                   d.tmpRootFs(),
+		Output:                   d.rawDiskPath(),
+		FinalSize:                d.rawDiskSize(),
+		StateSize:                d.rawDiskStateSize(),
+		RecoveryImageSize:        d.rawDiskRecoveryImageSize(),
+		NoDefaultCloudConfig:     d.Config.NoDefaultCloudConfig,
+		SeparatePartitionsImages: d.Config.Disk.Partitions,
+		MAAS:                     d.Config.Disk.MAAS,
+		BootActive:               d.Config.Disk.BootActive,
+	}
 }
 
 func (d *Deployer) StepConvertGCE() error {

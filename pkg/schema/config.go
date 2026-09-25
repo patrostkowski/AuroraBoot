@@ -83,6 +83,8 @@ type Disk struct {
 	Size              string `yaml:"size"`
 	StateSize         string `yaml:"state_size"`
 	RecoveryImageSize string `yaml:"recovery_image_size"`
+	// BootActive pre-builds COS_STATE with active.img so the EFI raw disk boots straight into active.
+	BootActive bool `yaml:"boot_active"`
 }
 
 type NetBoot struct {
@@ -158,6 +160,22 @@ func (c Config) Validate() error {
 		if c.Disk.VHD {
 			return fmt.Errorf("disk.partitions cannot be combined with disk.vhd: partition-image output does not produce a merged disk to convert")
 		}
+	}
+	return c.validateBootActive()
+}
+
+func (c Config) validateBootActive() error {
+	if !c.Disk.BootActive {
+		return nil
+	}
+	if c.Disk.BIOS {
+		return fmt.Errorf("disk.boot_active cannot be combined with disk.bios: only EFI raw disks are supported")
+	}
+	if c.Disk.Partitions {
+		return fmt.Errorf("disk.boot_active cannot be combined with disk.partitions: only merged raw disks are supported")
+	}
+	if c.Disk.MAAS {
+		return fmt.Errorf("disk.boot_active cannot be combined with disk.maas: MAAS images are not supported")
 	}
 	return nil
 }
