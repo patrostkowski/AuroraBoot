@@ -95,7 +95,8 @@ func bootActiveFirstBootConfig() *yipSchema.YipConfig {
 			stageRootfsBefore: {{
 				Name: "Add persistent partition",
 				Layout: yipSchema.Layout{
-					Device: &yipSchema.Device{Label: sdkConstants.RecoveryLabel},
+					// COS_STATE is on every boot-active disk, COS_RECOVERY may be skipped
+					Device: &yipSchema.Device{Label: sdkConstants.StateLabel},
 					Parts: []yipSchema.Partition{{
 						FSLabel:    sdkConstants.PersistentLabel,
 						PLabel:     sdkConstants.PersistentPartName,

@@ -60,8 +60,12 @@ type RawImage struct {
 	SeparatePartitionsImages bool
 	maas                     bool // if true, add the curtin-landing partition (COS_CURTIN) carrying /curtin/curtin-hooks (MAAS deploy)
 	// BootActive, when true, adds a COS_STATE partition with active.img so the disk boots straight into active.
-	BootActive        bool
-	systemImageSizeMB uint // size of recovery.img, reused for active.img
+	BootActive bool
+	// StateSlots is how many system images COS_STATE is sized for on boot-active disks, 0 for the default.
+	StateSlots int
+	// NoRecovery skips the COS_RECOVERY partition on boot-active disks.
+	NoRecovery        bool
+	systemImageSizeMB uint // size of recovery.img and active.img
 }
 
 // RawImageParams holds the inputs for building a raw disk image.
@@ -76,6 +80,8 @@ type RawImageParams struct {
 	SeparatePartitionsImages bool
 	MAAS                     bool
 	BootActive               bool
+	StateSlots               int
+	NoRecovery               bool
 }
 
 // NewEFIRawImage creates a new RawImage struct
@@ -104,6 +110,8 @@ func newRawImage(params RawImageParams, efi bool) *RawImage {
 		SeparatePartitionsImages: params.SeparatePartitionsImages,
 		maas:                     params.MAAS,
 		BootActive:               params.BootActive,
+		StateSlots:               params.StateSlots,
+		NoRecovery:               params.NoRecovery,
 	}
 }
 
@@ -327,15 +335,7 @@ func (r *RawImage) createRecoveryPartitionImage() (string, error) {
 		Source:     sdkImage.NewDirSrc(r.Source),
 		MountPoint: tmpDirRecoveryImage,
 	}
-	size, _ := config.GetSourceSize(r.config, recoveryImage.Source)
-	recoveryImage.Size, err = recoveryImageSize(uint64(size), r.RecoveryImageSize)
-	if err != nil {
-		return "", err
-	}
-	if r.RecoveryImageSize > 0 {
-		internal.Log.Logger.Info().Int64("size", r.RecoveryImageSize).Msg("Using configured recovery image size")
-	}
-	r.systemImageSizeMB = recoveryImage.Size
+	recoveryImage.Size = r.systemImageSizeMB
 
 	_, err = r.elemental.DeployImage(recoveryImage, false)
 	// Create recovery.squash from the rootfs into the recovery partition under cOS/
@@ -376,7 +376,6 @@ func (r *RawImage) createRecoveryPartitionImage() (string, error) {
 		File:       filepath.Join(r.TempDir(), "recovery.img"),
 		FS:         agentConstants.LinuxImgFs,
 		Label:      agentConstants.RecoveryLabel,
-		Size:       uint(size),
 		Source:     sdkImage.NewDirSrc(tmpDirRecovery),
 		MountPoint: tmpDirRecoveryImage,
 	}
@@ -392,6 +391,19 @@ func (r *RawImage) createRecoveryPartitionImage() (string, error) {
 
 	return recoverPartitionImage.File, nil
 
+}
+
+// systemImageSize returns the size in MB of the recovery and active images built from the rootfs.
+func (r *RawImage) systemImageSize() (uint, error) {
+	size, _ := config.GetSourceSize(r.config, sdkImage.NewDirSrc(r.Source))
+	imageSize, err := recoveryImageSize(uint64(size), r.RecoveryImageSize)
+	if err != nil {
+		return 0, err
+	}
+	if r.RecoveryImageSize > 0 {
+		internal.Log.Logger.Info().Int64("size", r.RecoveryImageSize).Msg("Using configured system image size")
+	}
+	return imageSize, nil
 }
 
 func recoveryImageSize(sourceSize uint64, configuredSize int64) (uint, error) {
@@ -554,15 +566,28 @@ func (r *RawImage) Build() error {
 	outputName := fmt.Sprintf("%s-%s.raw", constants.KairosDefaultArtifactName, utils.NameFromRootfs(r.Source))
 	internal.Log.Logger.Debug().Str("name", outputName).Msg("Got output name")
 
-	internal.Log.Logger.Info().Msg("Creating RECOVERY image")
-	// Create the Recovery partition
-	recoveryImagePath, err := r.createRecoveryPartitionImage()
+	if r.NoRecovery && !r.BootActive {
+		return fmt.Errorf("skipping the recovery partition requires a boot-active disk")
+	}
+	r.systemImageSizeMB, err = r.systemImageSize()
 	if err != nil {
-		internal.Log.Logger.Error().Err(err).Msg("failed to create recovery partition")
+		internal.Log.Logger.Error().Err(err).Msg("failed to calculate system image size")
 		return err
 	}
-	defer r.config.Fs.Remove(recoveryImagePath)
-	internal.Log.Logger.Info().Msg("Created RECOVERY image")
+
+	var recoveryImagePath string
+	if r.NoRecovery {
+		internal.Log.Logger.Info().Msg("Skipping RECOVERY image")
+	} else {
+		internal.Log.Logger.Info().Msg("Creating RECOVERY image")
+		recoveryImagePath, err = r.createRecoveryPartitionImage()
+		if err != nil {
+			internal.Log.Logger.Error().Err(err).Msg("failed to create recovery partition")
+			return err
+		}
+		defer r.config.Fs.Remove(recoveryImagePath)
+		internal.Log.Logger.Info().Msg("Created RECOVERY image")
+	}
 
 	internal.Log.Logger.Info().Msg("Creating BOOT image")
 	if r.efi {
@@ -610,10 +635,19 @@ func (r *RawImage) Build() error {
 		return nil
 	}
 
-	parts := []diskPart{
-		{img: oemImagePath, name: sdkConstants.OEMPartName, guidLabel: sdkConstants.OEMLabel},
-		{img: recoveryImagePath, name: agentConstants.RecoveryImgName, guidLabel: sdkConstants.RecoveryLabel},
+	// State goes last so recovery keeps its index and persistent is appended after state on first boot
+	var stateImagePath string
+	if r.BootActive {
+		internal.Log.Logger.Info().Msg("Creating STATE image")
+		stateImagePath, err = r.createStatePartitionImage()
+		if err != nil {
+			internal.Log.Logger.Error().Err(err).Msg("failed to create state partition")
+			return err
+		}
+		defer r.config.Fs.Remove(stateImagePath)
+		internal.Log.Logger.Info().Msg("Created STATE image")
 	}
+	parts := diskParts(oemImagePath, recoveryImagePath, stateImagePath)
 	if r.maas {
 		landing, err := r.createCurtinLandingPartitionImage()
 		if err != nil {
@@ -622,18 +656,6 @@ func (r *RawImage) Build() error {
 		}
 		defer r.config.Fs.Remove(landing)
 		parts = append([]diskPart{{img: landing, name: curtinPartName, guidLabel: curtinLabel}}, parts...)
-	}
-	// State goes last so recovery keeps its index and persistent is appended after state on first boot
-	if r.BootActive {
-		internal.Log.Logger.Info().Msg("Creating STATE image")
-		stateImagePath, err := r.createStatePartitionImage()
-		if err != nil {
-			internal.Log.Logger.Error().Err(err).Msg("failed to create state partition")
-			return err
-		}
-		defer r.config.Fs.Remove(stateImagePath)
-		parts = append(parts, diskPart{img: stateImagePath, name: sdkConstants.StatePartName, guidLabel: sdkConstants.StateLabel})
-		internal.Log.Logger.Info().Msg("Created STATE image")
 	}
 
 	// Create the final disk image
@@ -702,6 +724,23 @@ type diskPart struct {
 	img       string
 	name      string
 	guidLabel string
+}
+
+// diskParts returns the partitions after the boot partition in disk order, leaving out images that were not built.
+func diskParts(oemImagePath, recoveryImagePath, stateImagePath string) []diskPart {
+	candidates := []diskPart{
+		{img: oemImagePath, name: sdkConstants.OEMPartName, guidLabel: sdkConstants.OEMLabel},
+		{img: recoveryImagePath, name: agentConstants.RecoveryImgName, guidLabel: sdkConstants.RecoveryLabel},
+		{img: stateImagePath, name: sdkConstants.StatePartName, guidLabel: sdkConstants.StateLabel},
+	}
+	parts := make([]diskPart, 0, len(candidates))
+	for _, p := range candidates {
+		if p.img == "" {
+			continue
+		}
+		parts = append(parts, p)
+	}
+	return parts
 }
 
 // createDiskImage creates the final image by truncating the image with the proper size and

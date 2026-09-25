@@ -174,4 +174,24 @@ var _ = Describe("Config Validate", func() {
 		Entry("partitions", func(c *schema.Config) { c.Disk.Partitions = true }, "partitions"),
 		Entry("maas", func(c *schema.Config) { c.Disk.MAAS = true }, "maas"),
 	)
+
+	DescribeTable("single-image options",
+		func(set func(*schema.Config), wantErr string) {
+			set(&cfg)
+			err := cfg.Validate()
+			if wantErr == "" {
+				Expect(err).ToNot(HaveOccurred())
+				return
+			}
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(wantErr))
+		},
+		Entry("state_slots with boot_active", func(c *schema.Config) { c.Disk.BootActive = true; c.Disk.StateSlots = "1" }, ""),
+		Entry("no_recovery with boot_active", func(c *schema.Config) { c.Disk.BootActive = true; c.Disk.NoRecovery = true }, ""),
+		Entry("state_slots without boot_active", func(c *schema.Config) { c.Disk.StateSlots = "1" }, "disk.state_slots requires disk.boot_active"),
+		Entry("no_recovery without boot_active", func(c *schema.Config) { c.Disk.NoRecovery = true }, "disk.no_recovery requires disk.boot_active"),
+		Entry("state_slots too high", func(c *schema.Config) { c.Disk.BootActive = true; c.Disk.StateSlots = "4" }, "between 1 and 3"),
+		Entry("state_slots zero", func(c *schema.Config) { c.Disk.BootActive = true; c.Disk.StateSlots = "0" }, "between 1 and 3"),
+		Entry("state_slots not a number", func(c *schema.Config) { c.Disk.BootActive = true; c.Disk.StateSlots = "one" }, "between 1 and 3"),
+	)
 })

@@ -169,6 +169,8 @@ func (d *Deployer) rawImageParams() ops.RawImageParams {
 		SeparatePartitionsImages: d.Config.Disk.Partitions,
 		MAAS:                     d.Config.Disk.MAAS,
 		BootActive:               d.Config.Disk.BootActive,
+		StateSlots:               d.rawDiskStateSlots(),
+		NoRecovery:               d.Config.Disk.NoRecovery,
 	}
 }
 
@@ -403,6 +405,16 @@ func (d *Deployer) rawDiskStateSize() int64 {
 		return 0
 	}
 	return sizeInt
+}
+
+// rawDiskStateSlots returns disk.state_slots, 0 (the default) when unset or invalid; Validate rejects invalid values first.
+func (d *Deployer) rawDiskStateSlots() int {
+	slots, err := d.Config.Disk.StateSlotsCount()
+	if err != nil {
+		d.Log.Logger.Error().Err(err).Msg("Failed to parse disk state slots, using the default")
+		return 0
+	}
+	return slots
 }
 
 func (d *Deployer) rawDiskRecoveryImageSize() int64 {

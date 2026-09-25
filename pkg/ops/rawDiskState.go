@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/kairos-io/AuroraBoot/internal"
+	"github.com/kairos-io/AuroraBoot/pkg/schema"
 	"github.com/kairos-io/AuroraBoot/pkg/utils"
 	agentConstants "github.com/kairos-io/kairos/v4/agent/pkg/constants"
 	fsutils "github.com/kairos-io/kairos/v4/agent/pkg/utils/fs"
@@ -28,7 +29,9 @@ const (
 	stateGrubMenuFile       = "grubmenu"
 	rootfsBrandingGrubMenu  = "etc/kairos/branding/grubmenu.cfg"
 	stateSizeOverheadMB     = 100
-	stateSystemImageSlots   = 3 // active, passive and the transition image during upgrades
+	// stateFsOverheadPercent leaves room for ext4 reserved blocks (5%), the journal and inode tables.
+	stateFsOverheadPercent  = 10
+	stateSystemImageSlots   = schema.MaxStateSlots // default: active, passive and the transition image during upgrades
 	stateTempDirName        = "state"
 	stateMountTempDirName   = "state-mount"
 	activeMountTempDirName  = "active-mount"
@@ -65,7 +68,7 @@ fi
 // createStatePartitionImage builds the COS_STATE partition image that a reset would otherwise create on first boot.
 func (r *RawImage) createStatePartitionImage() (string, error) {
 	if r.systemImageSizeMB == 0 {
-		return "", fmt.Errorf("recovery image size unknown: the recovery partition must be created before the state partition")
+		return "", fmt.Errorf("system image size unknown: Build must calculate it before creating the state partition")
 	}
 
 	tmpDirState := filepath.Join(r.TempDir(), stateTempDirName)
@@ -111,7 +114,7 @@ func (r *RawImage) createStatePartitionImage() (string, error) {
 		File:       filepath.Join(r.TempDir(), statePartitionImageName),
 		FS:         sdkConstants.LinuxFs,
 		Label:      sdkConstants.StateLabel,
-		Size:       statePartitionSize(r.systemImageSizeMB, r.StateSize),
+		Size:       statePartitionSize(r.systemImageSizeMB, r.StateSlots, r.StateSize),
 		Source:     sdkImage.NewDirSrc(tmpDirState),
 		MountPoint: tmpDirStateMount,
 	}
@@ -122,12 +125,17 @@ func (r *RawImage) createStatePartitionImage() (string, error) {
 	return statePartitionImage.File, nil
 }
 
-// statePartitionSize returns the configured state size or enough room for active, passive and an upgrade transition image.
-func statePartitionSize(systemImageSizeMB uint, configuredSizeMB int64) uint {
+// statePartitionSize returns the configured state size, or room for the given number of system images (0 means the default).
+func statePartitionSize(systemImageSizeMB uint, slots int, configuredSizeMB int64) uint {
 	if configuredSizeMB > 0 {
 		return uint(configuredSizeMB)
 	}
-	return systemImageSizeMB*stateSystemImageSlots + stateSizeOverheadMB
+	if slots <= 0 {
+		slots = stateSystemImageSlots
+	}
+	payloadMB := systemImageSizeMB*uint(slots) + stateSizeOverheadMB
+	usablePercent := uint(100 - stateFsOverheadPercent)
+	return (payloadMB*100 + usablePercent - 1) / usablePercent
 }
 
 // writeStateGrubFiles mirrors what grub.Install and the boot assessment hooks leave on COS_STATE.

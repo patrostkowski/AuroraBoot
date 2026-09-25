@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 
 	agentConstants "github.com/kairos-io/kairos/v4/agent/pkg/constants"
+	sdkConstants "github.com/kairos-io/kairos/v4/sdk/constants"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -71,16 +72,45 @@ var _ = Describe("Raw disk state partition", Label("raw"), func() {
 		Expect(err.Error()).To(ContainSubstring("x86_64"))
 	})
 
-	It("requires the recovery image to be built first", func() {
+	It("requires the system image size to be calculated first", func() {
 		_, err := r.createStatePartitionImage()
 		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("system image size"))
+	})
+
+	It("sizes the system image from the rootfs without building recovery", func() {
+		size, err := r.systemImageSize()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(size).To(BeNumerically(">=", 200))
+
+		r.RecoveryImageSize = 5000
+		size, err = r.systemImageSize()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(size).To(Equal(uint(5000)))
 	})
 
 	DescribeTable("sizes the state partition",
-		func(systemImage uint, configured int64, expected uint) {
-			Expect(statePartitionSize(systemImage, configured)).To(Equal(expected))
+		func(systemImage uint, slots int, configured int64, expected uint) {
+			Expect(statePartitionSize(systemImage, slots, configured)).To(Equal(expected))
 		},
-		Entry("derived from the system image", uint(1000), int64(0), uint(3100)),
-		Entry("configured size wins", uint(1000), int64(5000), uint(5000)),
+		Entry("default slots", uint(1000), 0, int64(0), uint(3445)),
+		Entry("active only", uint(1000), 1, int64(0), uint(1223)),
+		Entry("room for one upgrade", uint(1000), 2, int64(0), uint(2334)),
+		Entry("full A/B", uint(1000), 3, int64(0), uint(3445)),
+		// Regression: 2319M active.img did not fit a 2419M ext4 STATE
+		Entry("kubeadm image, active only", uint(2319), 1, int64(0), uint(2688)),
+		Entry("configured size wins over slots", uint(1000), 1, int64(5000), uint(5000)),
+	)
+
+	DescribeTable("orders the partitions after the boot partition",
+		func(recovery string, expected []string) {
+			var names []string
+			for _, p := range diskParts("oem.img", recovery, "state.img") {
+				names = append(names, p.name)
+			}
+			Expect(names).To(Equal(expected))
+		},
+		Entry("with recovery", "recovery.img", []string{sdkConstants.OEMPartName, agentConstants.RecoveryImgName, sdkConstants.StatePartName}),
+		Entry("without recovery", "", []string{sdkConstants.OEMPartName, sdkConstants.StatePartName}),
 	)
 })

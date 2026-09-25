@@ -70,7 +70,7 @@ var _ = Describe("Raw disk first boot config", Label("raw"), func() {
 		stages := got.Stages[stageRootfsBefore]
 		Expect(stages).To(HaveLen(1))
 		Expect(stages[0].Commands).To(BeEmpty())
-		Expect(stages[0].Layout.Device.Label).To(Equal(sdkConstants.RecoveryLabel))
+		Expect(stages[0].Layout.Device.Label).To(Equal(sdkConstants.StateLabel))
 		Expect(stages[0].Layout.Parts).To(Equal([]yipSchema.Partition{{
 			FSLabel:    sdkConstants.PersistentLabel,
 			PLabel:     sdkConstants.PersistentPartName,

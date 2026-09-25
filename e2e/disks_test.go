@@ -143,6 +143,38 @@ stages:
 				Expect(gptTable.Partitions).To(HaveLen(4))
 				Expect(gptTable.Partitions[3].Name).To(Equal("state"))
 			})
+			It("generates a single-image boot-active raw disk without recovery", func() {
+				image := "quay.io/kairos/opensuse:tumbleweed-core-amd64-generic-v3.2.1"
+				_, err := PullImage(image)
+				Expect(err).ToNot(HaveOccurred())
+
+				out, err := aurora.Run("--debug",
+					"--set", "disable_http_server=true",
+					"--set", "disable_netboot=true",
+					"--set", "container_image=oci://"+image,
+					"--set", "state_dir=/tmp/auroraboot",
+					"--set", "disk.efi=true",
+					"--set", "disk.boot_active=true",
+					"--set", "disk.no_recovery=true",
+					"--set", "disk.state_slots=1",
+					"--cloud-config", "/config.yaml",
+				)
+				Expect(err).ToNot(HaveOccurred(), out)
+				Expect(out).To(ContainSubstring("Skipping RECOVERY image"), out)
+				Expect(out).To(ContainSubstring("Created STATE image"), out)
+				rawDisk := filepath.Join(tempDir, "kairos-opensuse-tumbleweed-core-amd64-generic-v3.2.1.raw")
+
+				disk, err := diskfs.Open(rawDisk, diskfs.WithOpenMode(diskfs.ReadOnly))
+				Expect(err).ToNot(HaveOccurred())
+				defer disk.Close()
+				table, err := disk.GetPartitionTable()
+				Expect(err).ToNot(HaveOccurred())
+				gptTable, ok := table.(*gpt.Table)
+				Expect(ok).To(BeTrue())
+				Expect(gptTable.Partitions).To(HaveLen(3))
+				Expect(gptTable.Partitions[1].Name).To(Equal("oem"))
+				Expect(gptTable.Partitions[2].Name).To(Equal("state"))
+			})
 			It("generates a gce image", func() {
 				image := "quay.io/kairos/opensuse:tumbleweed-core-amd64-generic-v3.2.1"
 				_, err := PullImage(image)
